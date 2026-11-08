@@ -644,6 +644,9 @@ def _comfy_env() -> dict[str, str]:
             entries = path.split(os.pathsep) if path else []
             if not entries or entries[0] != bin_dir:
                 env["PATH"] = bin_dir + (os.pathsep + path if path else "")
+    proxy_port = target._get_active_proxy_port()
+    if proxy_port:
+        env["COMFY_LOCAL_URL"] = f"http://127.0.0.1:{proxy_port}"
     return env
 
 

@@ -183,6 +183,46 @@ def _redact_config_url(url: str) -> str:
     return f"{masked[: cut + 1]}<redacted>"
 
 
+def _get_active_proxy_upstream() -> str | None:
+    """Return the active proxy upstream URL, if proxying."""
+    try:
+        from .proxy import get_active_proxy_upstream
+
+        return get_active_proxy_upstream()
+    except ImportError:
+        return None
+
+
+def _get_active_proxy_port() -> int | None:
+    """Return the active proxy port, if proxying."""
+    try:
+        from .proxy import get_active_proxy_port
+
+        return get_active_proxy_port()
+    except ImportError:
+        return None
+
+
+def _should_use_proxy(url: str, parsed: Any) -> bool:
+    """Determine whether the target URL should be handled via the loopback proxy."""
+    if os.environ.get("COMFYUI_PROXY", "").strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    if os.environ.get("COMFYUI_AUTH") or os.environ.get("COMFY_BASIC_AUTH"):
+        return True
+    if os.environ.get("COMFYUI_USER") or os.environ.get("COMFY_AUTH_USER"):
+        return True
+    # Username in URL: if it's not a placeholder like <user>
+    if parsed.username and not (parsed.username.startswith("<") and parsed.username.endswith(">")):
+        return True
+    # HTTPS scheme: if it's not an RFC 2606 test dummy domain (.example, .test, .invalid, .localhost)
+    if parsed.scheme == "https":
+        host = (parsed.hostname or "").lower()
+        if host.endswith((".example", ".test", ".invalid", ".localhost")):
+            return False
+        return True
+    return False
+
+
 def _comfy_target() -> tuple[str, int, str] | None:
     """Resolve the configured ComfyUI ``(host, port, source)``, or None for local.
 
@@ -214,6 +254,22 @@ def _comfy_target() -> tuple[str, int, str] | None:
             raise ComfyCliError(
                 f"COMFYUI_URL is malformed: {_redact_config_url(url)!r} ({exc})."
             ) from exc
+
+        if _should_use_proxy(url, parsed):
+            if not host:
+                raise ComfyCliError(
+                    f"COMFYUI_URL is set but names no host: {_redact_config_url(url)!r}. "
+                    "Use e.g. http://<host>:8188 (or set COMFYUI_HOST/COMFYUI_PORT)."
+                )
+            if port == 0:
+                raise ComfyCliError(
+                    f"COMFYUI_URL port is out of range (1-65535): {_redact_config_url(url)!r}."
+                )
+            from .proxy import get_or_start_proxy
+
+            proxy_host, proxy_port = get_or_start_proxy(url)
+            return proxy_host, proxy_port, "COMFYUI_URL"
+
         if parsed.scheme and parsed.scheme != "http":
             raise ComfyCliError(
                 f"COMFYUI_URL scheme {parsed.scheme!r} is not supported "
