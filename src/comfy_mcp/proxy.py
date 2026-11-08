@@ -134,6 +134,11 @@ class ComfyProxyHandler(http.server.BaseHTTPRequestHandler):
         else:
             req_headers["Host"] = upstream_host
 
+        # Avoid default Python-urllib user agent being blocked by Cloudflare (error 1010)
+        ua = req_headers.get("User-Agent", "")
+        if not ua or "Python-urllib" in ua:
+            req_headers["User-Agent"] = "comfy-mcp"
+
         if self.server.auth_header and not any(k.lower() == "authorization" for k in req_headers):
             req_headers["Authorization"] = self.server.auth_header
 
@@ -230,8 +235,13 @@ class ComfyProxyHandler(http.server.BaseHTTPRequestHandler):
             ]
             for k, v in self.headers.items():
                 k_lower = k.lower()
-                if k_lower not in ("host", "upgrade", "connection", "authorization"):
+                if k_lower not in ("host", "upgrade", "connection", "authorization", "user-agent"):
                     lines.append(f"{k}: {v}")
+
+            ua = self.headers.get("User-Agent", "")
+            if not ua or "Python-urllib" in ua:
+                ua = "comfy-mcp"
+            lines.append(f"User-Agent: {ua}")
 
             if self.server.auth_header:
                 lines.append(f"Authorization: {self.server.auth_header}")
