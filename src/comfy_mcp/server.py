@@ -64,6 +64,7 @@ import base64
 import contextlib
 import errno
 import functools
+import inspect
 import ipaddress
 import json
 import logging
@@ -94,6 +95,7 @@ from . import (
     errors,
     failure_log,
     instructions,
+    output_viewer,
     params,
     target,
     tcc,
@@ -130,6 +132,18 @@ def _server_version() -> str:
     return cli._version()
 
 
+# The MCP Apps inline output viewer (`output_viewer`). Registering the `ui://`
+# resource is the one capability that genuinely lives here rather than in
+# comfy-cli — an MCP protocol surface comfy-cli cannot express — so it is built
+# here and handed to the server as an extension. The resource and its tool
+# pointer are advertised UNCONDITIONALLY: a host that never negotiated the
+# extension ignores `_meta.ui` and shows the tool's existing text/image content,
+# so this is strictly additive. The pointer is stamped via `@mcp.tool(meta=...)`,
+# not `Apps.tool`, so the SDK's own dangling-URI check never sees it;
+# `test_meta_ui_is_set_on_exactly_the_two_result_tools` pins it to the
+# registered resource instead.
+_apps = output_viewer.build_apps()
+
 # `version` is passed explicitly because the SDK does not infer one: it defaults
 # to `""` and `Server.server_info` hands that straight to the client, so an
 # unversioned server answers `initialize` with `"serverInfo": {"name":
@@ -139,7 +153,46 @@ mcp = MCPServer(
     "comfy-mcp",
     version=_server_version(),
     instructions=instructions.INSTRUCTIONS,
+    extensions=[_apps],
 )
+
+
+def _as_object(payload: Any) -> Any:
+    """Hand back ``payload`` as the object an ``outputSchema`` tool must return.
+
+    A ``dict`` (and a prebuilt ``CallToolResult``) passes through untouched; any
+    other shape — a list, ``None``, a scalar — is kept verbatim under ``data``,
+    the spelling ``_with_cancel_verdict`` already uses for a non-object reply.
+    """
+    if isinstance(payload, (dict, types.CallToolResult)):
+        return payload
+    return {"data": payload}
+
+
+def _object_payload(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Make a ``-> dict[str, Any]`` tool's reply satisfy its own ``outputSchema``.
+
+    The SDK validates a structured tool's return value against that schema AFTER
+    the tool ran, and ``_run_comfy`` returns the envelope's ``data`` unchanged —
+    so a ``null`` or list payload would turn a call that already spent credits,
+    cancelled a job, or finished a download into a validation-error failure the
+    agent is invited to retry. Wrapping every exit here, below ``@mcp.tool()``,
+    keeps that guarantee in one place instead of at each tool's return sites.
+    """
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            return _as_object(await fn(*args, **kwargs))
+
+    else:
+
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            return _as_object(fn(*args, **kwargs))
+
+    return wrapper
+
 
 # Allow overriding the binary (e.g. a venv path) without touching code. The
 # companion address override needs no constant here: a LOCAL ComfyUI on a
@@ -3372,8 +3425,16 @@ def _freshness_report() -> Any:
         return {"error": str(exc)}
 
 
-@mcp.tool()
-def server_info() -> Any:
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
+@_object_payload
+def server_info() -> dict[str, Any]:
     """Report the local ComfyUI/comfy-cli environment and verify compatibility.
 
     Wraps ``comfy env``. Call this first to confirm a local ComfyUI is up before
@@ -3474,7 +3535,14 @@ _RETRYABLE_CREDENTIAL_CODES = frozenset(
 _CREDENTIAL_RETRY_BACKOFFS = (1.0, 2.0)
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
 def auth_status() -> Any:
     """Comfy Cloud credential status for partner-API nodes (read-only; never returns secrets).
 
@@ -3530,7 +3598,14 @@ _BILLING_STATUS_TIMEOUT = 180.0
 _BILLING_STATUS_STDOUT_MAX_CHARS = 1024 * 1024
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
 async def billing_status() -> Any:
     """Comfy Cloud credit balance, plan tier and job concurrency — READ-ONLY, spends nothing.
 
@@ -4083,7 +4158,14 @@ async def _abandon_login_child(child: _LoginChild) -> None:
         await asyncio.gather(child.reader, return_exceptions=True)
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    )
+)
 async def auth_login() -> Any:
     """Start Comfy Cloud sign-in; returns an OAuth URL for the USER to open.
 
@@ -4124,14 +4206,22 @@ async def auth_login() -> Any:
         return payload
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    )
+)
+@_object_payload
 async def run_workflow(
     workflow_path: str,
     wait: bool = True,
     timeout_seconds: float = 110.0,
     confirm_spend: bool = False,
     ctx: Context | None = None,
-) -> Any:
+) -> dict[str, Any]:
     """Run a ComfyUI workflow JSON on the ComfyUI this server targets.
 
     That is this machine unless ``COMFYUI_URL``/``COMFYUI_HOST`` points the
@@ -4426,7 +4516,14 @@ def _t2i_config() -> tuple[str, str, str]:
     )
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    )
+)
 async def generate_image(
     prompt: str,
     checkpoint: str | None = None,
@@ -5193,7 +5290,14 @@ def _generate_catalog_gap(exc: ComfyCliError, verb: str) -> ComfyCliError:
 # not this tool: `partner_generate` waits either way, so callers never branch
 # on it. `summary` is the model's full one-line description, not the
 # `…`-clipped form comfy-cli's human table cuts to fit its column.
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def list_partner_models(
     style: str = "",
     partner: str = "",
@@ -5289,7 +5393,14 @@ def list_partner_models(
     }
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def partner_model_schema(model: str) -> Any:
     """Show one partner model's callable parameters — the input to ``partner_generate``.
 
@@ -5333,7 +5444,15 @@ def partner_model_schema(model: str) -> Any:
         raise
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    )
+)
+@_object_payload
 async def partner_generate(
     model: str,
     params: dict[str, Any] | None = None,
@@ -5341,7 +5460,7 @@ async def partner_generate(
     out_path: str | None = None,
     timeout_seconds: float = 600.0,
     ctx: Context | None = None,
-) -> Any:
+) -> dict[str, Any]:
     """Run a hosted PARTNER model (Flux / Ideogram / DALL·E / Recraft / …) — SPENDS CREDITS.
 
     Wraps ``comfy generate <model> [--param=value]…``. Runs entirely on the
@@ -5507,7 +5626,14 @@ def _require_emit_workflow_capability() -> None:
     _emit_workflow_capability_probed = True
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 async def emit_partner_workflow(
     model: str,
     out_path: str,
@@ -6008,7 +6134,15 @@ async def _run_template_exec(
 # the gate does not exist. Probing `comfy generate consent` here would test an
 # unrelated subsystem and wrongly refuse free, local-only template runs on a
 # CLI that lacks it.
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    )
+)
+@_object_payload
 async def run_template(
     name: str,
     params: dict[str, Any] | None = None,
@@ -6016,7 +6150,7 @@ async def run_template(
     wait: bool = True,
     timeout_seconds: float = 600.0,
     ctx: Context | None = None,
-) -> Any:
+) -> dict[str, Any]:
     """Run a gallery template — fetch, fill params, execute.
 
     Wraps ``comfy run-template <name> [--param=KEY=VALUE]…`` (fetches the
@@ -6641,13 +6775,21 @@ _JOB_ACTIONS_TAKING_PROMPT_ID = ("status", "error", "wait", "watch", "cancel")
 _JOB_ACTIONS_TAKING_TIMEOUT = ("wait", "watch")
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
+)
+@_object_payload
 async def job(
     action: str = "status",
     prompt_id: str = "",
     timeout_seconds: float | None = None,
     ctx: Context | None = None,
-) -> Any:
+) -> dict[str, Any]:
     """Inspect, wait on, watch, or cancel a submitted job — one action per call.
 
     Wraps the `comfy jobs` family. `action`:
@@ -6871,7 +7013,14 @@ def _resource_verb_upgrade_error(
     )
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def system_stats() -> Any:
     """Read the live local ComfyUI's VRAM per device and system RAM.
 
@@ -6902,7 +7051,14 @@ def system_stats() -> Any:
     return target._annotate_comfy_target(data)
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def free_memory(unload_models: bool = True, free_memory: bool | None = None) -> Any:
     """Ask the local ComfyUI to unload models / reset its executor cache.
 
@@ -7181,14 +7337,25 @@ def _render_output_media(
 # `description` field), so this stays reader prose rather than an internal
 # cross-reference. For maintainers: that's `target._TARGET_AWARE_SUBCOMMANDS`
 # (src/comfy_mcp/target.py) — `download` is not in it, which is the whole point
-# being made below.
-@mcp.tool()
+# being made below. Not idempotent: `comfy download` never overwrites — a repeat
+# into the same `out_dir` writes a collision-suffixed copy (`name.1.ext`) — which
+# is also why it is not destructive.
+@mcp.tool(
+    meta=output_viewer.TOOL_META,
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+)
+@_object_payload
 def fetch_outputs(
     prompt_id: str,
     out_dir: str,
     url_only: bool = False,
     inline_images: bool = False,
-) -> Any:
+) -> dict[str, Any]:
     """Download a completed job's output files into ``out_dir``.
 
     Wraps ``comfy download <prompt_id> --where local -o <out_dir>``.
@@ -7230,17 +7397,23 @@ def fetch_outputs(
         return data
     blocks, records = _render_output_media(_collect_output_media(data, preview_dir))
     # A `CallToolResult` is how this verb carries BOTH content blocks and a
-    # `structuredContent` manifest — a bare list return produces only the former.
-    # `fetch_outputs` returns `Any`, so the SDK validates no output schema and
-    # passes this through unchanged (see `convert_result`).
+    # `structuredContent` payload — a bare list return produces only the former.
+    # The SDK passes a returned `CallToolResult` through unchanged (see
+    # `convert_result`), so this branch builds the object its `dict[str, Any]`
+    # `outputSchema` advertises itself: the download metadata — wrapped by
+    # `_as_object` exactly as `_object_payload` wraps the plain return — plus the
+    # `media` manifest. The text block keeps the metadata alone, verbatim.
+    metadata = _as_object(data)
     content: list[types.ContentBlock] = [
         types.TextContent(
             type="text",
-            text=json.dumps(data, indent=2, default=str, ensure_ascii=False),
+            text=json.dumps(metadata, indent=2, default=str, ensure_ascii=False),
         ),
         *blocks,
     ]
-    return types.CallToolResult(content=content, structured_content={"media": records})
+    return types.CallToolResult(
+        content=content, structured_content={**metadata, "media": records}
+    )
 
 
 def _preview_image_path(data: Any) -> str | None:
@@ -7256,7 +7429,15 @@ def _preview_image_path(data: Any) -> str | None:
     return resolved if os.path.isfile(resolved) else None
 
 
-@mcp.tool()
+@mcp.tool(
+    meta=output_viewer.TOOL_META,
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
 def preview_media(
     media_path: str,
     out_path: str = "",
@@ -7753,7 +7934,14 @@ def _launch_comfyui_sync(extra_args: list[str]) -> Any:
 # exception is `FileNotFoundError: 'comfy'` from the inner re-invocation. The
 # upstream fix — re-invoking via `sys.executable -m comfy_cli` instead of a
 # bare name — is still desirable, but this server no longer depends on it.
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
+)
 async def launch_comfyui(
     extra_args: list[str] | None = None,
     confirm_network_exposure: bool = False,
@@ -7816,7 +8004,14 @@ async def launch_comfyui(
     return await asyncio.to_thread(_launch_comfyui_sync, guarded)
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def stop_comfyui() -> Any:
     """Stop the LOCAL ComfyUI server that comfy-cli launched.
 
@@ -8574,7 +8769,14 @@ def _recycle_untracked_server(
         ) from exc
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
+)
 async def restart_comfyui(
     extra_args: list[str] | None = None,
     confirm_network_exposure: bool = False,
@@ -8803,7 +9005,14 @@ async def _resolve_update_all_consent(
         )
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    )
+)
 async def update_comfyui(
     target: str = "comfy",
     confirm_update_all: bool = False,
@@ -9129,7 +9338,14 @@ def _run_version_switch(version: str) -> Any:
         ) from exc
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    )
+)
 async def switch_comfyui_version(
     version: str,
     confirm_switch: bool = False,
@@ -9659,7 +9875,14 @@ def _run_node_install(names: list[str]) -> Any:
 # ComfyUI-Manager itself does from its live UI. The one case that can still
 # disturb a running server is a pack that upgrades a dependency ComfyUI already
 # imported, which is another reason to restart promptly after installing.
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    )
+)
 async def install_node(
     names: list[str],
     confirm_install: bool = False,
@@ -9800,7 +10023,14 @@ _LOG_PORT_UPGRADE_HINT = (
 )
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def get_logs(tail: int = 200, port: int | None = None) -> Any:
     """Return the tail of the LOCAL background ComfyUI's captured log file.
 
@@ -9870,7 +10100,15 @@ def get_logs(tail: int = 200, port: int | None = None) -> Any:
     return data
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        title="Discover comfy-cli commands",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def discover(schemas_only: bool = True, command: str = "") -> Any:
     """Return comfy-cli's self-describing command surface (its own contract).
 
@@ -9944,7 +10182,15 @@ def discover(schemas_only: bool = True, command: str = "") -> Any:
     return data
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        title="Which ComfyUI is targeted",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def which() -> Any:
     """Report which ComfyUI install/workspace comfy-cli currently targets.
 
@@ -9959,7 +10205,14 @@ def which() -> Any:
 _PROJECT_ACTIONS = ("status", "init")
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def project(action: str = "status") -> Any:
     """Report or create the operator-anchored comfy-cli project (`project/1`).
 
@@ -10144,7 +10397,14 @@ def _unmatched_template_tokens(rows: list[dict], query_lower: str) -> list[str]:
     return [t for t in tokens if not any(word.startswith(t) for word in vocabulary)]
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
 def search_templates(
     query: str = "",
     limit: int = 25,
@@ -10625,7 +10885,14 @@ def _check_not_requested() -> dict:
     )
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
 def get_template(name: str, check_local: bool = True) -> Any:
     """Show one template's details/schema, and whether your install can run it.
 
@@ -10667,7 +10934,14 @@ def get_template(name: str, check_local: bool = True) -> Any:
     }
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
 def fetch_template(name: str, out_path: str, check_local: bool = True) -> dict:
     """Write a template's runnable workflow JSON to ``out_path``; report if it can run here.
 
@@ -11089,7 +11363,15 @@ _NODES_ACTIONS_TAKING_PATH_TYPES = ("path",)
 _NODES_ACTIONS_TAKING_DEPTH_PATHS = ("path",)
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        title="Search the local node catalog",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def nodes(
     action: str = "search",
     query: str = "",
@@ -11307,7 +11589,14 @@ def nodes(
 # against the venv on every call); the `registry_id` half reflects the
 # registry's LATEST published version, which is not necessarily what an
 # install would actually resolve to.
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
 def node_dependencies(pack: str = "", registry_id: str = "") -> Any:
     """Report a custom node pack's Python dependency requirements vs the installed venv (read-only).
 
@@ -11579,7 +11868,14 @@ def _parse_deps_manifest(out_path: str, plain: Any) -> dict:
 # fetched per Manager's own channel/mode settings and CACHED there — so a pack
 # published minutes ago may not be attributed yet even though this call itself
 # never caches. `state` is read off this install's disk on every call.
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
 async def workflow_deps(workflow_path: str) -> Any:
     """Map a workflow's node classes to the node PACKS that provide them (read-only).
 
@@ -11726,7 +12022,14 @@ async def workflow_deps(workflow_path: str) -> Any:
     return manifest
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def search_models(query: str = "", folder: str = "") -> Any:
     """Search / list model files available to the LOCAL ComfyUI install.
 
@@ -12363,14 +12666,22 @@ def _poll_download(download_id: str, timeout_seconds: float) -> Any:
     )
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    )
+)
+@_object_payload
 async def download_model(
     url: str,
     relative_path: str | None = None,
     filename: str | None = None,
     wait: bool = True,
     timeout_seconds: float = 110.0,
-) -> Any:
+) -> dict[str, Any]:
     """Download a model file into the LOCAL ComfyUI models dir, by URL.
 
     Wraps ``comfy model download --url <url> [--relative-path <path>]
@@ -12661,12 +12972,20 @@ _DOWNLOAD_ACTION_VERB = {
 }
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
+)
+@_object_payload
 def download(
     action: str = "status",
     download_id: str = "",
     timeout_seconds: float | None = None,
-) -> Any:
+) -> dict[str, Any]:
     """Track a transfer already started by download_model; does NOT start one.
 
     Wraps `comfy model download-status`/`download-cancel`. `action`:
@@ -12760,7 +13079,14 @@ def download(
 _UPLOAD_STDOUT_MAX_CHARS = 4 * 1024 * 1024
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
+)
 async def upload_file(paths: list[str], overwrite: bool = False) -> Any:
     """Upload files from this machine into the target ComfyUI's ``input`` directory.
 
@@ -12840,7 +13166,14 @@ async def upload_file(paths: list[str], overwrite: bool = False) -> Any:
         ) from exc
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def validate_workflow(workflow_path: str, object_info_path: str = "") -> Any:
     """Pre-flight a workflow against a node catalog before running it.
 
@@ -13002,7 +13335,14 @@ def _flag_mispaired_slots(data: Any) -> Any:
     return data
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def list_workflow_slots(workflow_path: str) -> Any:
     """List the agent-tweakable slots a frontend-format workflow exposes.
 
@@ -13027,7 +13367,14 @@ def list_workflow_slots(workflow_path: str) -> Any:
     return _flag_mispaired_slots(data)
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def list_workflow_notes(workflow_path: str) -> Any:
     """List the documentation notes a frontend-format workflow carries.
 
@@ -13106,7 +13453,14 @@ def list_workflow_notes(workflow_path: str) -> Any:
         }
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
+)
 def set_workflow_slot(
     workflow_path: str,
     overrides: list[str | SlotOverride],
@@ -13199,7 +13553,14 @@ def set_workflow_slot(
     return _run_comfy(*args, timeout=60.0)
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def vary_workflow(
     workflow_path: str,
     slots: list[str | SlotVariants],
