@@ -3664,6 +3664,16 @@ def auth_status() -> Any:
 # request itself.
 _BILLING_STATUS_TIMEOUT = 180.0
 
+# `comfy cloud status` is a per-VERB floor like `_MIN_WATCH_COMFY_CLI`, not a
+# raise of `_MIN_COMFY_CLI`: every other tool works at 1.14.0, and refusing
+# them all to report a balance would be the worse trade. Unlike watch's it
+# gates nothing — the verb either dispatches or Click refuses it, and the
+# degrade below reads comfy-cli's own answer rather than a version string. It
+# exists so the ONE number a caller below the floor needs is in the message.
+# comfy-cli 1.17.0 (2026-08-22) is where `comfy_cli/cloud/command.py` first
+# registers `status_cmd`; 1.16.0 has the `cloud` group without the leaf.
+_MIN_BILLING_COMFY_CLI_STR = "1.17.0"
+
 # `_run_comfy_async` keeps only the trailing `_STDERR_MAX_CHARS` (64 KiB) of
 # stdout by default, which is the one place its contract is narrower than
 # `_run_comfy`'s unbounded `communicate()`. That bound exists for a multi-GB
@@ -3706,7 +3716,7 @@ async def billing_status() -> Any:
     not something to re-derive from the numbers.
 
     Signed out raises comfy-cli's own error — get the user signed in with
-    ``auth_login`` / ``auth_status``. On a comfy-cli predating the verb,
+    ``auth_login`` / ``auth_status``. Below comfy-cli 1.17.0,
     degrades to ``{"error", "unsupported": True}`` carrying
     ``balance_confirmed: False`` and the balance fields ``null``, so the rule
     above holds there too.
@@ -3749,12 +3759,16 @@ async def billing_status() -> Any:
         # user can actually act on, and burying them under "your CLI is old"
         # would send them to the wrong fix.
         #
-        # Unlike those two this is NOT an edge path: `cloud status` landed in
-        # comfy-cli AFTER its newest release, so today every install answers
-        # this verb with Click's usage dump and this branch is the common one.
-        # It is expected to become the rare case once the verb ships, which is
-        # why the message names no version floor to go stale — the installed
-        # comfy-cli either has the verb or does not.
+        # This is an edge path, and the comment here said the opposite until
+        # 2026-11-17. `comfy cloud status` shipped in comfy-cli
+        # `_MIN_BILLING_COMFY_CLI_STR` (2026-08-22), nine releases before
+        # 0.11.0 went out saying no tagged release had the verb yet, so on any
+        # install at or above the floor this branch never runs and the degrade
+        # it writes is unreachable. The "names no version floor to go stale"
+        # rule went with that premise: there IS a floor, it is the one number a
+        # user below it needs, and leaving it out told a 1.26.0 install to
+        # upgrade to nothing in particular. Say the version, the way
+        # `_MIN_WATCH_COMFY_CLI_STR` does for `job(action="watch")`.
         #
         # No `clitext._phrase_is_only_the_caller_s` subtraction here (which
         # `list_workflow_notes` needs): this tool takes no arguments, so nothing
@@ -3786,8 +3800,8 @@ async def billing_status() -> Any:
         return {
             "error": (
                 "billing status unavailable: the installed comfy-cli does not "
-                "support 'comfy cloud status' (the verb ships in a comfy-cli "
-                "newer than the one installed here). Nothing was broken by "
+                "support 'comfy cloud status' (the verb ships in comfy-cli "
+                f"{_MIN_BILLING_COMFY_CLI_STR} and newer). Nothing was broken by "
                 # Deliberately about STATE, not about capability: on the
                 # whole-group-missing branch below, sign-in is not available
                 # either, so a blanket "sign-in is unchanged" would contradict
@@ -10828,6 +10842,7 @@ def search_templates(
     model: str = "",
     provider: str = "",
     exclude_api: bool = False,
+    runnable_only: bool = False,
 ) -> Any:
     """Search the built-in ComfyUI workflow-template gallery.
 
@@ -10861,14 +10876,20 @@ def search_templates(
         tag/type/model/provider: forwarded filters (``tag``/``type`` exact,
             ``model``/``provider`` substring).
         exclude_api: drop ``API``-tagged rows.
+        runnable_only: keep only templates every weight for which is already on
+            THIS install (``comfy templates ls --runnable``) — comfy-cli's own
+            runnable filter. Weights only — step-4 validation is still
+            MANDATORY. The FIRST such call is slow (300s cap, not 60s).
+            ``query`` still narrows on top, without ``unmatched_query_words``.
+            A remote target adds a ``comfy_target_note``.
         limit/offset: page results (``limit`` capped at 200).
 
-    Step 1: pick a ``name``, inspect with ``get_template``, then
-    ``fetch_template``. Step 4 — validating before ``run_workflow`` — is
-    MANDATORY via ``local_check``.
+    Step 1: pick a ``name``, inspect with ``get_template`` (and
+    ``check_template`` for a runnable verdict), then ``fetch_template``. Step 4
+    — validating before ``run_workflow`` — is MANDATORY via ``local_check``.
 
     Freshness: CACHED, 24h TTL as of v1.14.0; refresh via ``comfy templates
-    refresh``. NOT read from the local install.
+    refresh``. NOT read from the local install (``runnable_only`` aside).
     """
     if limit < 0:
         raise ComfyCliError(f"invalid limit: {limit} (must be >= 0)")
@@ -10888,7 +10909,41 @@ def search_templates(
             argv._reject_option_like(f"{flag} value", value)
             argv._reject_nul(f"{flag} value", value)
             args += [flag, value]
-    data = _run_comfy(*args, timeout=60.0)
+    if runnable_only:
+        args.append("--runnable")
+    # `--runnable` fetches every candidate's workflow to check it on the first
+    # run (comfy-cli caches after), so it needs the wider cap a cold fetch does.
+    try:
+        data = _run_comfy(*args, timeout=300.0 if runnable_only else 60.0)
+    except ComfyCliError as exc:
+        # The flag is newer than this server's comfy-cli floor. Say so by name
+        # rather than relay Click's usage dump — and never fall back to the
+        # unfiltered gallery, which would answer "runnable" with rows that are
+        # not. Narrow as at every option site: the parser's own phrase, minus
+        # any copy a caller forged through a filter value.
+        if (
+            not runnable_only
+            or not clitext._is_missing_option_error(exc, "--runnable")
+            or clitext._phrase_is_only_the_caller_s(
+                exc,
+                clitext._MISSING_OPTION_RE_TEMPLATE.format(
+                    option=re.escape("--runnable")
+                ),
+                tag,
+                type,
+                model,
+                provider,
+            )
+        ):
+            raise
+        raise ComfyCliError(
+            "search_templates(runnable_only=True) unavailable: the installed "
+            "comfy-cli's `templates ls` has no `--runnable` filter (it landed "
+            "after comfy-cli 1.26.0); upgrade with `pip install -U comfy-cli`, or "
+            "drop runnable_only and ask `check_template` per template.",
+            no_envelope=exc.no_envelope,
+            returncode=exc.returncode,
+        ) from exc
 
     if not isinstance(data, dict) or not isinstance(data.get("rows"), list):
         shape = (
@@ -10929,9 +10984,12 @@ def search_templates(
         if not rows:
             rows = [r for r in candidates if _template_matches(r, q)]
             relaxed = bool(rows)
-        if not rows:
+        if not rows and not runnable_only:
             # Only computed on the empty path, where it is the whole value: a
-            # populated result needs no explanation.
+            # populated result needs no explanation. Not under `runnable_only`:
+            # `candidates` is then only the runnable subset, so a word matching
+            # nothing in it may still match a template whose weights are
+            # missing, and "matched nothing in the gallery" would be false.
             unmatched = _unmatched_template_tokens(candidates, q)
 
     total = len(rows)
@@ -10959,6 +11017,8 @@ def search_templates(
             f"{', '.join(unmatched)}. Drop or reword them and search again — all "
             "query words must match, so each extra word only narrows the result."
         )
+    if runnable_only:
+        return target._annotate_comfy_target(result, target._TEMPLATE_TARGET_NOTE)
     return result
 
 
@@ -11346,6 +11406,63 @@ def get_template(name: str, check_local: bool = True) -> Any:
         if check_local
         else _check_not_requested(),
     }
+
+
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
+def check_template(name: str) -> Any:
+    """Say whether THIS install has a gallery template's weights, before you fetch it.
+
+    Wraps ``comfy templates check <name>``. Step 2.5 of the on-ramp — after
+    ``search_templates``, before ``fetch_template`` — so you can tell the user
+    what to download (or steer them to an API-key flow) up front.
+
+    comfy-cli returns the verdict — ``runnable`` (every weight is already on
+    this install), ``missing-models`` (names the missing files and their
+    download URLs, ready to hand the user or feed to ``download_model``),
+    ``api-required`` (a paid hosted node — needs a signed-in account and spends
+    credits, so ``run_template`` fails it CLOSED unless ``confirm_spend=True``),
+    or ``unknown`` (comfy-cli could not decide). The verdict is comfy-cli's own;
+    this is a thin passthrough and adds no logic of its own.
+
+    A model/API check, NOT validation: ``runnable`` says nothing of custom
+    nodes or input values, so step-4 ``local_check`` is still MANDATORY. It
+    reads comfy-cli's own ComfyUI's weights; a remote target adds a note.
+    """
+    # Bare positional: a leading-dash name is read by comfy-cli as an option
+    # rather than the template to check (argument injection).
+    argv._reject_option_like(
+        "name", name, expected="a template name (e.g. 'image_flux2')"
+    )
+    argv._reject_nul("name", name)
+    try:
+        data = _run_comfy("templates", "check", name, timeout=120.0)
+    except ComfyCliError as exc:
+        # The verb is at this server's comfy-cli floor, but that floor fails
+        # OPEN — name the version gap rather than relay Click's usage dump. The
+        # same caller-echo subtraction as every degrade site whose argv carries
+        # caller text.
+        if not clitext._is_missing_verb_error(
+            exc, "check"
+        ) or clitext._phrase_is_only_the_caller_s(
+            exc,
+            clitext._MISSING_VERB_RE_TEMPLATE.format(verb=re.escape("check")),
+            name,
+        ):
+            raise
+        raise ComfyCliError(
+            "check_template unavailable: the installed comfy-cli has no "
+            f"`comfy templates check` verb. It {_RESOURCE_VERB_UPGRADE_HINT}.",
+            no_envelope=exc.no_envelope,
+            returncode=exc.returncode,
+        ) from exc
+    return target._annotate_comfy_target(data, target._TEMPLATE_TARGET_NOTE)
 
 
 @mcp.tool(
@@ -13816,6 +13933,26 @@ def _flag_mispaired_slots(data: Any) -> Any:
     return data
 
 
+# `comfy workflow slots --node` landed in comfy-cli 1.23.0 (`7fd101a`,
+# 2026-10-17, the commit that also made a `get_template`-inserted node
+# addressable by its template id); 1.22.0 and older have the verb and not the
+# option. A per-VERB floor like `_MIN_WATCH_COMFY_CLI`, not a raise of
+# `_MIN_COMFY_CLI`: unfiltered `list_workflow_slots` works at 1.14.0, and the
+# filter is an optimization, so refusing every tool over it would be the wrong
+# trade.
+_MIN_SLOT_FILTER_COMFY_CLI = (1, 23, 0)
+_MIN_SLOT_FILTER_COMFY_CLI_STR = "1.23.0"
+
+_SLOT_FILTER_VERSION_ERROR = (
+    f"list_workflow_slots(node=...) requires comfy-cli "
+    f"{_MIN_SLOT_FILTER_COMFY_CLI_STR} or newer: `comfy workflow slots` has no "
+    f"`--node` option before {_MIN_SLOT_FILTER_COMFY_CLI_STR}, and passing one "
+    "makes Click print usage instead of a payload. Upgrade with `pip install "
+    "-U comfy-cli`, or call list_workflow_slots without `node` and filter the "
+    "rows by their `address` prefix."
+)
+
+
 @mcp.tool(
     annotations=types.ToolAnnotations(
         readOnlyHint=True,
@@ -13824,7 +13961,7 @@ def _flag_mispaired_slots(data: Any) -> Any:
         openWorldHint=False,
     )
 )
-def list_workflow_slots(workflow_path: str) -> Any:
+def list_workflow_slots(workflow_path: str, node: str = "") -> Any:
     """List the agent-tweakable slots a frontend-format workflow exposes.
 
     Wraps ``comfy workflow slots <path>``. A "slot" is a parameter comfy-cli
@@ -13838,13 +13975,45 @@ def list_workflow_slots(workflow_path: str) -> Any:
     alongside plain ``A.name`` for promoted proxy widgets — both come back in
     ``address`` and are set the same way.
 
+    ``node`` narrows the answer to one node's slots — a node id, or a subgraph
+    instance id, which brings every ``<id>/<inner>`` inside it. Needs comfy-cli
+    1.23.0: below that it is REFUSED, not answered unfiltered. An unknown id
+    is an error naming the ids that do exist, not an empty list.
+
     Slots are tweakable PARAMETERS only — Note/MarkdownNote text is not a
     slot; use ``list_workflow_notes`` for that.
     """
     # Bare positional, same as `set_workflow_slot` — a leading-dash path is read
     # as a flag rather than the path comfy-cli is meant to read.
     argv._guard_workflow_path(workflow_path, frontend=True)
-    data = _run_comfy("workflow", "slots", workflow_path, timeout=60.0)
+    # Why the floor REFUSES rather than dropping the filter: an unfiltered
+    # answer is exactly the context cost `node` was passed to avoid, and a
+    # caller that believes it was applied reads a whole graph's slots as one
+    # node's. The docstring says it is refused; this says why.
+    extra: tuple[str, ...] = ()
+    if node:
+        # Hygiene guards, inside the branch so `node=""` keeps meaning "no
+        # filter" rather than becoming an error (same shape as
+        # `search_models`). `_reject_option_like` applies here for the reason
+        # it applies to a slot ADDR: an address begins with the node id, which
+        # comfy-cli surfaces non-negative, so no reachable id starts with `-`.
+        node = argv._guard_arg_len(
+            "node", argv._reject_option_like("node", argv._reject_nul("node", node))
+        )
+        # Per-VERB floor, read BEFORE the call rather than from the failure:
+        # comfy-cli below 1.23.0 has no `--node` on `workflow slots`, and Click
+        # answers an unknown option with a usage dump on exit 2 and no
+        # envelope, which surfaces as "returned no JSON" instead of naming the
+        # one number the caller needs. The same policy as
+        # `_MIN_WATCH_COMFY_CLI`: fail OPEN on an unreadable version, and
+        # un-latch the memo on the way out so the upgrade this error asks for
+        # takes effect inside the same server process.
+        version = _checked_comfy_version()
+        if version is not None and version < _MIN_SLOT_FILTER_COMFY_CLI:
+            _invalidate_version_cache()
+            raise ComfyCliError(_SLOT_FILTER_VERSION_ERROR)
+        extra = ("--node", node)
+    data = _run_comfy("workflow", "slots", workflow_path, *extra, timeout=60.0)
     return _flag_mispaired_slots(data)
 
 
