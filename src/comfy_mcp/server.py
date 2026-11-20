@@ -487,6 +487,34 @@ _STREAM_LINE_LIMIT = 1024 * 1024
 _MIN_COMFY_CLI = (1, 14, 0)
 _MIN_COMFY_CLI_STR = "1.14.0"
 
+# comfy-cli's unstamped placeholder, exempted from the floor above.
+#
+# `comfy-cli`'s `pyproject.toml` carries `version = "0.0.0"` until its publish
+# workflow rewrites it from the release tag, and `ConfigManager.get_cli_version`
+# ALSO returns `"0.0.0"` when the `importlib.metadata` lookup fails outright. So
+# every source install, editable checkout and metadata-less environment reports
+# `0.0.0`, and no comfy-cli release ever has: the value means "this build's
+# version is unknown", never "this build is old".
+#
+# The floor's documented policy is to fail OPEN on a `--version` it cannot
+# positively read as too old. `"0.0.0"` parses cleanly, so `(0, 0, 0) <
+# (1, 14, 0)` made the guard fail CLOSED on exactly the builds whose version it
+# could not establish — every tool refused with "too old, upgrade", on a
+# checkout that may well be NEWER than the floor. The reported workaround was to
+# hand-stamp `pyproject.toml` before testing.
+#
+# Exactly this tuple, not a `major == 0` range: `0.1.0` and `0.0.1` are versions
+# somebody could really have published, and the leniency is meant to cover the
+# placeholder rather than the whole pre-1.0 range.
+#
+# Compared as a PARSED tuple, so the exemption also covers the handful of
+# strings `_parse_version` normalizes to it — `"0.0"` pads to `(0, 0, 0)`, and a
+# four-part `"0.0.0.1"` truncates to it. Deliberate: comfy-cli has never
+# published any of them either, and matching the raw token instead would mean a
+# `"version 0.0"` build is refused while `"version 0.0.0"` is waved through,
+# which is a distinction with no cause behind it.
+_UNSTAMPED_COMFY_CLI = (0, 0, 0)
+
 # The version guard shells out to `comfy --version`; memoize so it runs at most
 # once per process (it sits on the hot path of every _run_comfy call).
 _version_checked = False
@@ -1050,6 +1078,15 @@ def _probe_comfy_version() -> None:
     version = None
     if proc.returncode == 0:
         version = _parse_version(proc.stdout) or _parse_version(proc.stderr)
+    # An unstamped build reports a version it does not have. Normalized to None
+    # HERE, before the global is written and before the floor compares, so every
+    # reader sees one "unknown" and not two: the server-wide floor below, the
+    # per-verb floors reading `_comfy_cli_version`, and the opt-in
+    # `COMFY_CLI_MIN_VERSION` report all already treat None as fail-OPEN, and a
+    # second sentinel that each of them had to know about is how one of them
+    # ends up refusing a source build on its own.
+    if version == _UNSTAMPED_COMFY_CLI:
+        version = None
     # Recorded UNCONDITIONALLY, and BEFORE the floor check below, which raises
     # WITHOUT latching `_version_checked`: a too-old install the caller retries
     # in the same process re-runs this whole function, and a per-verb floor
@@ -2755,7 +2792,12 @@ def _watch_no_events_hint(version: tuple[int, int, int] | None) -> str:
     Naming an outdated comfy-cli is the whole point when the version is
     UNREADABLE: an install below :data:`_MIN_WATCH_COMFY_CLI` that slipped past
     the gate — which fails OPEN on an unparseable ``--version`` — produces
-    exactly this payload, and this is the only place left to say so. But when
+    exactly this payload, and this is the only place left to say so. It is named
+    as ONE of two open causes rather than as the likely one, because the
+    unreadable-version population is mostly source checkouts of `main`: those
+    are usually NEWER than the floor, so asserting "usually too old" would send
+    the majority of the people who see this line to upgrade a comfy-cli that is
+    already ahead of the one being asked for. But when
     the gate positively VERIFIED the floor, that half is a diagnosis the code
     already knows is false: a job sitting queued behind another, or loading
     models, for the whole 600s default yields zero events on a perfectly modern
@@ -2777,9 +2819,12 @@ def _watch_no_events_hint(version: tuple[int, int, int] | None) -> str:
             "`timeout_seconds`"
         )
     return (
-        f"{_WATCH_NO_EVENTS_HINT} — this usually means comfy-cli < "
-        f"{_MIN_WATCH_COMFY_CLI_STR} (jobs watch cannot attach as the "
-        "submitting session there)"
+        f"{_WATCH_NO_EVENTS_HINT} — this server could not establish the "
+        "comfy-cli version, so both causes are open: an install below "
+        f"{_MIN_WATCH_COMFY_CLI_STR} (where `jobs watch` cannot attach as the "
+        "submitting session), or a job queued behind another or still loading "
+        'models. Check `comfy --version`, then poll `job(action="status")` or '
+        "watch again with a longer `timeout_seconds`"
     )
 
 
@@ -3392,6 +3437,13 @@ def _detect_comfy_cli_version() -> str | None:
     if proc.returncode != 0:
         return None
     parsed = _parse_version(proc.stdout)
+    # Same exemption as the server-wide floor, and this is the SECOND site that
+    # needed it: an unstamped build reported `"0.0.0"` here, so a deployment
+    # setting `COMFY_CLI_MIN_VERSION` raised "comfy-cli 0.0.0 is older than the
+    # required minimum" on it, and `server_info` published a version the build
+    # does not have. None takes the documented "could not determine" path.
+    if parsed == _UNSTAMPED_COMFY_CLI:
+        return None
     return ".".join(str(part) for part in parsed) if parsed else None
 
 
@@ -7582,6 +7634,30 @@ def _media_type(path: str) -> str:
     )
 
 
+def _download_dest(data: Any, out_dir: str | None) -> str | None:
+    """Resolve the directory ``comfy download`` wrote to, for media scoping.
+
+    comfy-cli's download payload carries ``out_dir`` as an already-resolved
+    absolute path, and has since **1.14.0** — this server's own floor
+    (``_MIN_COMFY_CLI``) — so this needs no per-verb version gate and is read
+    rather than recomputed. It is the only answer available when the caller
+    omitted the parameter and comfy-cli chose the directory itself.
+
+    The fallback matters only when the payload lacks the field: with a
+    caller-supplied ``out_dir`` it reproduces the previous behaviour, matching
+    the download child's cwd before it ran (the MCP client's cwd may hold a
+    stale, same-named output directory). With no parameter and no field there is
+    nothing to resolve, so this returns ``None`` and the caller skips inlining.
+    """
+    if isinstance(data, dict):
+        reported = data.get("out_dir")
+        if isinstance(reported, str) and reported:
+            return os.path.realpath(reported)
+    if out_dir is None:
+        return None
+    return os.path.realpath(os.path.join(_project_root() or os.curdir, out_dir))
+
+
 def _collect_output_media(data: Any, out_dir: str) -> list[tuple[str, str]]:
     """Resolve media files referenced by ``comfy download``'s data to on-disk paths.
 
@@ -7730,6 +7806,21 @@ def _render_output_media(
 # being made below. Not idempotent: `comfy download` never overwrites — a repeat
 # into the same `out_dir` writes a collision-suffixed copy (`name.1.ext`) — which
 # is also why it is not destructive.
+#
+# `out_dir` is optional because comfy-cli already resolves a project-aware
+# default and this tool required the parameter anyway, which made the wrapper
+# stricter than the command it wraps: a caller who had configured a download
+# directory once still had to name a path on every call, and an LLM caller has
+# to invent one. Omitting the parameter leaves `-o` off the argv rather than
+# reproducing comfy-cli's resolution here — the thin-wrapper reading of the
+# same request (Comfy-Org/comfy-mcp#304), where an `AUTO_DOWNLOAD_PATH` this
+# server interpreted itself would have been the wrong shape. Full effect needs
+# Comfy-Org/comfy-cli#1158: below it, `comfy download`'s own `--out-dir`
+# default is the literal `./outputs`, which shadows the resolver, so omitting
+# `-o` lands files relative to this server's spawn directory (`COMFY_PROJECT`
+# when set) rather than at the configured default. That is already an
+# improvement on a path the model guessed, and it becomes the configured
+# default the moment #1158 ships.
 @mcp.tool(
     meta=output_viewer.TOOL_META,
     annotations=types.ToolAnnotations(
@@ -7742,14 +7833,18 @@ def _render_output_media(
 @_object_payload
 def fetch_outputs(
     prompt_id: str,
-    out_dir: str,
+    out_dir: str | None = None,
     url_only: bool = False,
     inline_images: bool = False,
 ) -> dict[str, Any]:
     """Download a completed job's output files into ``out_dir``.
 
-    Wraps ``comfy download <prompt_id> --where local -o <out_dir>``.
+    Wraps ``comfy download <prompt_id> --where local [-o <out_dir>]``.
     ``url_only=True`` emits URLs without downloading.
+
+    Omit ``out_dir`` and comfy-cli picks it: the project's ``outputs/``, its
+    configured default, or ``./outputs``; the returned ``out_dir`` names where
+    it wrote.
 
     Remote jobs work although ``download`` is not in
     ``_TARGET_AWARE_SUBCOMMANDS``: the submitting run's local state file maps
@@ -7767,16 +7862,13 @@ def fetch_outputs(
     # here — `-o` takes a value, so comfy-cli reads even a dash-led one as this
     # option's argument, and a relative path is legitimate input. Size runs
     # ahead of the NUL refusal for the ordering reason `argv._guard_arg_len` gives.
-    argv._guard_arg_len("out_dir", out_dir)
-    out_dir = argv._reject_nul("out_dir", out_dir)
-    preview_dir = out_dir
-    if inline_images and not url_only:
-        # Match the download child's cwd before it runs; the MCP client's cwd
-        # may contain a stale, same-named output directory.
-        preview_dir = os.path.realpath(
-            os.path.join(_project_root() or os.curdir, out_dir)
-        )
-    args = ["download", prompt_id, "-o", out_dir]
+    # Both guards are skipped when the parameter is absent: there is no string to
+    # bound, and `-o` is then not on the argv at all.
+    args = ["download", prompt_id]
+    if out_dir is not None:
+        argv._guard_arg_len("out_dir", out_dir)
+        out_dir = argv._reject_nul("out_dir", out_dir)
+        args += ["-o", out_dir]
     if url_only:
         args.append("--url-only")
     data = _run_comfy(*args, timeout=300.0)
@@ -7784,6 +7876,14 @@ def fetch_outputs(
     # — short-circuit rather than let basename matching surface stale files from
     # a previous run into ``out_dir`` (which would contradict the docstring).
     if not inline_images or url_only:
+        return data
+    preview_dir = _download_dest(data, out_dir)
+    if preview_dir is None:
+        # Nothing to scope the manifest to. `_collect_output_media` requires a
+        # containing directory to reject a same-named file in this process's CWD
+        # (see its docstring), and guessing comfy-cli's resolution here would
+        # duplicate a default this server deliberately does not own. The download
+        # itself succeeded, so return its metadata rather than failing the call.
         return data
     blocks, records = _render_output_media(_collect_output_media(data, preview_dir))
     # A `CallToolResult` is how this verb carries BOTH content blocks and a
